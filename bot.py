@@ -30,7 +30,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "ضع_توكن_البوت_هنا")
 
 # ضع رقم حسابك هنا، وليس اليوزر فقط.
 # لمعرفة الرقم أرسل /id للبوت.
-ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID", "105405258"))
+ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID", "0"))
 
 OWNER_USERNAME = "@J_6_K"
 RIGHTS_CHANNEL = "@sn3nn"
