@@ -85,6 +85,22 @@ bot_runtime_stats = {
     "errors_count": 0
 }
 
+
+def ensure_default_configs():
+    if not os.path.exists(DATABASE_FILES["timer"]):
+        save_data("timer", "3")
+    if not os.path.exists(DATABASE_FILES["auto_publish"]):
+        save_data("auto_publish", "enabled")
+    if not os.path.exists(DATABASE_FILES["notifications"]):
+        save_data("notifications", "enabled")
+    if not os.path.exists(DATABASE_FILES["mode"]):
+        save_data("mode", "public")
+    if not os.path.exists(DATABASE_FILES["rights"]):
+        save_data("rights", "قناتنا الرسمية")
+    if not os.path.exists(DATABASE_FILES["welcome"]):
+        save_data("welcome", "أهلاً بك في بوت أسعار العملات الرقمية المتطور 🚀")
+
+
 def load_data(file_key, default_value):
     filename = DATABASE_FILES.get(file_key, "fallback_data.json")
     if os.path.exists(filename):
@@ -97,6 +113,7 @@ def load_data(file_key, default_value):
             logger.error(f"فشل قراءة الملف {filename}: {err}")
             return default_value
     return default_value
+
 
 def save_data(file_key, data_payload):
     filename = DATABASE_FILES.get(file_key, "fallback_data.json")
@@ -148,10 +165,10 @@ def get_auto_publish_status():
 
 def get_timer_minutes():
     try:
-        val = int(load_data("timer", "60"))
-        return val if val > 0 else 60
+        val = int(load_data("timer", "3"))
+        return val if val > 0 else 3
     except ValueError:
-        return 60
+        return 3
 
 # ==============================================================================
 # 4. محرك جلب الأسعار والـ APIs
@@ -262,6 +279,7 @@ def start_cmd(message: Message):
         bot.reply_to(message, "⚠️ البوت في وضع الصيانة حالياً.")
         return
 
+    ensure_default_configs()
     welcome_msg = load_data("welcome", f"أهلاً بك يا {user.first_name} في بوت أسعار العملات الرقمية المتطور 🚀")
     bot.send_message(message.chat.id, welcome_msg, reply_markup=get_main_reply_keyboard(user), parse_mode="Markdown")
 
@@ -299,6 +317,7 @@ def message_handler(message: Message):
 
     if uid in user_state:
         state = user_state[uid]
+
         if state == "wait_channel":
             channels = load_data("channels", [])
             if text not in channels:
@@ -307,6 +326,7 @@ def message_handler(message: Message):
             bot.reply_to(message, f"✅ تمت إضافة القناة بنجاح: `{text}`", parse_mode="Markdown", reply_markup=get_main_reply_keyboard(user))
             del user_state[uid]
             return
+
         elif state == "wait_broadcast":
             success_count = 0
             for u in load_data("users", []):
@@ -320,12 +340,65 @@ def message_handler(message: Message):
                     bot.copy_message(ch, message.chat.id, message.message_id, reply_markup=get_channel_post_keyboard())
                 except Exception:
                     pass
-            bot.reply_to(message, f"✅ تمت الإذاعة بنجاح إلى المستخدمين والقنوات.", reply_markup=get_main_reply_keyboard(user))
+            bot.reply_to(message, "✅ تمت الإذاعة بنجاح إلى المستخدمين والقنوات.", reply_markup=get_main_reply_keyboard(user))
             del user_state[uid]
             return
+
         elif state == "wait_welcome":
             save_data("welcome", text)
-            bot.reply_to(message, "✅ تم تحديث رسالة التر��يب بنجاح.", reply_markup=get_main_reply_keyboard(user))
+            bot.reply_to(message, "✅ تم تحديث رسالة الترحيب بنجاح.", reply_markup=get_main_reply_keyboard(user))
+            del user_state[uid]
+            return
+
+        elif state == "wait_timer":
+            try:
+                minutes = int(text)
+                if minutes <= 0:
+                    raise ValueError
+                save_data("timer", str(minutes))
+                bot.reply_to(message, f"✅ تم ضبط المؤقت على `{minutes}` دقيقة.", parse_mode="Markdown", reply_markup=get_main_reply_keyboard(user))
+                del user_state[uid]
+                return
+            except ValueError:
+                bot.reply_to(message, "⚠️ أرسل رقمًا صحيحًا أكبر من صفر فقط، مثال: `3`", parse_mode="Markdown")
+                return
+
+        elif state == "wait_rights":
+            save_data("rights", text)
+            bot.reply_to(message, "✅ تم تحديث حقوق القناة بنجاح.", reply_markup=get_main_reply_keyboard(user))
+            del user_state[uid]
+            return
+
+        elif state == "wait_block_manage":
+            try:
+                user_id = int(text)
+            except ValueError:
+                bot.reply_to(message, "⚠️ أرسل رقم الآيدي فقط، مثال: `123456789`", parse_mode="Markdown")
+                return
+
+            blocked = load_data("blocked", [])
+            if user_id in blocked:
+                blocked.remove(user_id)
+                action = "تم إلغاء الحظر عن"
+            else:
+                blocked.append(user_id)
+                action = "تم حظر"
+            save_data("blocked", blocked)
+            bot.reply_to(message, f"✅ {action} المستخدم: `{user_id}`", parse_mode="Markdown", reply_markup=get_main_reply_keyboard(user))
+            del user_state[uid]
+            return
+
+        elif state == "wait_admin_manage":
+            username = text.strip().replace("@", "")
+            admins = load_data("admins", [])
+            if username in admins:
+                admins.remove(username)
+                action = "تم حذف"
+            else:
+                admins.append(username)
+                action = "تمت إضافة"
+            save_data("admins", admins)
+            bot.reply_to(message, f"✅ {action} المشرف: `{username}`", parse_mode="Markdown", reply_markup=get_main_reply_keyboard(user))
             del user_state[uid]
             return
 
@@ -474,6 +547,43 @@ def callbacks(c):
             bot.send_message(c.message.chat.id, "✍️ أرسل نص رسالة الترحيب الجديدة:")
             bot.answer_callback_query(c.id)
 
+        elif data == "edit_timer":
+            user_state[uid] = "wait_timer"
+            bot.send_message(c.message.chat.id, "⏳ أرسل عدد الدقائق الجديدة، مثال: `3`", parse_mode="Markdown")
+            bot.answer_callback_query(c.id)
+
+        elif data == "manage_blocks":
+            if not is_admin(user):
+                bot.answer_callback_query(c.id, "⚠️ لا تملك صلاحية إدارة الحظر.", show_alert=True)
+                return
+            blocked = load_data("blocked", [])
+            if blocked:
+                blocked_text = "\n".join([str(x) for x in blocked])
+            else:
+                blocked_text = "لا يوجد مستخدمون محظورون حالياً."
+            user_state[uid] = "wait_block_manage"
+            bot.send_message(c.message.chat.id, f"🚫 قائمة المحظورين:\n{blocked_text}\n\nأرسل الآيدي لإضافة أو إزالة الحظر.", parse_mode="Markdown")
+            bot.answer_callback_query(c.id)
+
+        elif data == "manage_admins":
+            if not is_admin(user):
+                bot.answer_callback_query(c.id, "⚠️ لا تملك صلاحية إدارة المشرفين.", show_alert=True)
+                return
+            admins = load_data("admins", [])
+            if admins:
+                admins_text = "\n".join([str(x) for x in admins])
+            else:
+                admins_text = "لا يوجد مشرفون إضافيون." 
+            user_state[uid] = "wait_admin_manage"
+            bot.send_message(c.message.chat.id, f"👑 قائمة المشرفين:\n{admins_text}\n\nأرسل اسم المستخدم بدون @ لإضافة أو حذف المشرف.", parse_mode="Markdown")
+            bot.answer_callback_query(c.id)
+
+        elif data == "edit_rights":
+            user_state[uid] = "wait_rights"
+            current_rights = load_data("rights", "قناتنا الرسمية")
+            bot.send_message(c.message.chat.id, f"🎨 النص الحالي للحقوق:\n`{current_rights}`\n\nأرسل النص الجديد:", parse_mode="Markdown")
+            bot.answer_callback_query(c.id)
+
         elif data == "bot_stats":
             users_count = len(load_data('users', []))
             blocked_count = len(load_data('blocked', []))
@@ -507,6 +617,7 @@ def callbacks(c):
 # 8. التشغيل التلقائي الآمن
 # ==============================================================================
 if __name__ == "__main__":
+    ensure_default_configs()
     logger.info("جاري تشغيل البوت بنجاح...")
     while True:
         try:
