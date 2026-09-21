@@ -1,17 +1,21 @@
 import asyncio
-import json
+import logging
 import os
 import re
-from pathlib import Path
+import sqlite3
+from contextlib import closing
 from datetime import datetime
+from pathlib import Path
+from typing import Optional
 
 import httpx
 from telegram import (
-    Update,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    Update,
 )
 from telegram.constants import ChatMemberStatus
+from telegram.error import TelegramError
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -22,105 +26,276 @@ from telegram.ext import (
 )
 
 
-# =========================
+# =========================================================
 # الإعدادات
-# =========================
+# =========================================================
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "ضع_توكن_البوت_هنا")
-
-# ضع رقم حسابك هنا، وليس اليوزر فقط.
-# لمعرفة الرقم أرسل /id للبوت.
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID", "0"))
 
-OWNER_USERNAME = "@J_6_K"
+# هذه القناة حقوق فقط، ولن تتم الإضافة إليها أو النشر فيها
 RIGHTS_CHANNEL = "@sn3nn"
+OWNER_USERNAME = "@J_6_K"
 
-DATA_FILE = Path("bot_data.json")
-PUBLISH_JOB_NAME = "ton_price_publisher"
+DATABASE_FILE = Path("bot.sqlite3")
+LOG_FILE = Path("bot.log")
+JOB_NAME = "ton_price_publisher"
 
-DEFAULT_INTERVAL = 180  # 3 دقائق
+# أقل مدة مسموحة بين المنشورات
+MIN_INTERVAL_SECONDS = 10
 
-
-# =========================
-# التخزين
-# =========================
-
-def default_data():
-    return {
-        "channels": [],
-        "interval": DEFAULT_INTERVAL,
-        "publishing": False,
-    }
+# CoinGecko وBinance كمصدرين احتياطيين
+COINGECKO_URL = "https://api.coingecko.com/api/v3/simple/price"
+BINANCE_URL = "https://api.binance.com/api/v3/ticker/price?symbol=TONUSDT"
 
 
-def load_data():
-    if not DATA_FILE.exists():
-        return default_data()
+# =========================================================
+# التسجيل في السجل
+# =========================================================
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    handlers=[
+        logging.FileHandler(LOG_FILE, encoding="utf-8"),
+        logging.StreamHandler(),
+    ],
+)
+
+logger = logging.getLogger("ton_bot")
+
+
+# =========================================================
+# قاعدة البيانات
+# =========================================================
+
+def db_connect() -> sqlite3.Connection:
+    connection = sqlite3.connect(DATABASE_FILE)
+    connection.row_factory = sqlite3.Row
+    return connection
+
+
+def init_database() -> None:
+    with closing(db_connect()) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS channels (
+                chat_id TEXT PRIMARY KEY,
+                title TEXT,
+                added_at TEXT NOT NULL,
+                last_success TEXT,
+                last_error TEXT
+            );
+            """
+        )
+
+        defaults = {
+            "interval": "180",
+            "publishing": "0",
+        }
+
+        for key, value in defaults.items():
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO settings(key, value)
+                VALUES (?, ?)
+                """,
+                (key, value),
+            )
+
+        connection.commit()
+
+
+def get_setting(key: str, default: Optional[str] = None) -> Optional[str]:
+    with closing(db_connect()) as connection:
+        row = connection.execute(
+            "SELECT value FROM settings WHERE key = ?",
+            (key,),
+        ).fetchone()
+
+    return row["value"] if row else default
+
+
+def set_setting(key: str, value: str) -> None:
+    with closing(db_connect()) as connection:
+        connection.execute(
+            """
+            INSERT INTO settings(key, value)
+            VALUES (?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            """,
+            (key, value),
+        )
+        connection.commit()
+
+
+def get_interval() -> int:
     try:
-        with DATA_FILE.open("r", encoding="utf-8") as file:
-            data = json.load(file)
-
-        result = default_data()
-        result.update(data)
-        return result
-
-    except Exception:
-        return default_data()
+        return max(int(get_setting("interval", "180")), MIN_INTERVAL_SECONDS)
+    except ValueError:
+        return 180
 
 
-def save_data(data):
-    with DATA_FILE.open("w", encoding="utf-8") as file:
-        json.dump(data, file, ensure_ascii=False, indent=2)
+def is_publishing() -> bool:
+    return get_setting("publishing", "0") == "1"
 
 
-DATA = load_data()
+def get_channels() -> list[sqlite3.Row]:
+    with closing(db_connect()) as connection:
+        return connection.execute(
+            """
+            SELECT chat_id, title, added_at, last_success, last_error
+            FROM channels
+            ORDER BY added_at ASC
+            """
+        ).fetchall()
 
 
-# =========================
-# التحقق من الإدارة
-# =========================
+def get_channel(chat_id: str) -> Optional[sqlite3.Row]:
+    with closing(db_connect()) as connection:
+        return connection.execute(
+            "SELECT * FROM channels WHERE chat_id = ?",
+            (chat_id,),
+        ).fetchone()
 
-def is_admin(user_id: int) -> bool:
-    return ADMIN_USER_ID != 0 and user_id == ADMIN_USER_ID
+
+def add_channel(chat_id: str, title: str) -> None:
+    with closing(db_connect()) as connection:
+        connection.execute(
+            """
+            INSERT INTO channels(chat_id, title, added_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(chat_id) DO UPDATE SET
+                title = excluded.title
+            """,
+            (
+                chat_id,
+                title,
+                datetime.now().isoformat(timespec="seconds"),
+            ),
+        )
+        connection.commit()
 
 
-async def admin_only(update: Update) -> bool:
+def remove_channel(chat_id: str) -> None:
+    with closing(db_connect()) as connection:
+        connection.execute(
+            "DELETE FROM channels WHERE chat_id = ?",
+            (chat_id,),
+        )
+        connection.commit()
+
+
+def update_channel_success(chat_id: str) -> None:
+    with closing(db_connect()) as connection:
+        connection.execute(
+            """
+            UPDATE channels
+            SET last_success = ?, last_error = NULL
+            WHERE chat_id = ?
+            """,
+            (
+                datetime.now().isoformat(timespec="seconds"),
+                chat_id,
+            ),
+        )
+        connection.commit()
+
+
+def update_channel_error(chat_id: str, error: str) -> None:
+    with closing(db_connect()) as connection:
+        connection.execute(
+            """
+            UPDATE channels
+            SET last_error = ?
+            WHERE chat_id = ?
+            """,
+            (error[:1000], chat_id),
+        )
+        connection.commit()
+
+
+# =========================================================
+# التحقق من المالك
+# =========================================================
+
+def is_admin(user_id: Optional[int]) -> bool:
+    return bool(user_id and ADMIN_USER_ID and user_id == ADMIN_USER_ID)
+
+
+async def require_admin(update: Update) -> bool:
     user = update.effective_user
 
-    if not user or not is_admin(user.id):
-        if update.callback_query:
-            await update.callback_query.answer(
-                "غير مسموح لك باستخدام لوحة التحكم.",
-                show_alert=True,
-            )
-        elif update.effective_message:
-            await update.effective_message.reply_text(
-                "هذا البوت مخصص للمالك فقط."
-            )
-        return False
+    if is_admin(user.id if user else None):
+        return True
 
-    return True
+    if update.callback_query:
+        await update.callback_query.answer(
+            "هذا الخيار متاح للمالك فقط.",
+            show_alert=True,
+        )
+    elif update.effective_message:
+        await update.effective_message.reply_text(
+            "هذا البوت مخصص للمالك فقط."
+        )
+
+    return False
 
 
-# =========================
-# جلب سعر TON
-# =========================
+# =========================================================
+# السعر
+# =========================================================
+
+async def get_ton_price_from_coingecko() -> float:
+    async with httpx.AsyncClient(timeout=15) as client:
+        response = await client.get(
+            COINGECKO_URL,
+            params={
+                "ids": "the-open-network",
+                "vs_currencies": "usd",
+            },
+        )
+        response.raise_for_status()
+        data = response.json()
+
+    price = data["the-open-network"]["usd"]
+    return float(price)
+
+
+async def get_ton_price_from_binance() -> float:
+    async with httpx.AsyncClient(timeout=15) as client:
+        response = await client.get(BINANCE_URL)
+        response.raise_for_status()
+        data = response.json()
+
+    return float(data["price"])
+
 
 async def get_ton_price() -> float:
-    url = "https://api.coingecko.com/api/v3/simple/price"
-    params = {
-        "ids": "the-open-network",
-        "vs_currencies": "usd",
-    }
+    errors = []
 
-    async with httpx.AsyncClient(timeout=15) as client:
-        response = await client.get(url, params=params)
-        response.raise_for_status()
-        result = response.json()
+    for source in (
+        get_ton_price_from_coingecko,
+        get_ton_price_from_binance,
+    ):
+        try:
+            price = await source()
 
-    price = result["the-open-network"]["usd"]
-    return float(price)
+            if price > 0:
+                return price
+
+        except Exception as error:
+            errors.append(str(error))
+
+    raise RuntimeError(
+        "تعذر جلب سعر TON من جميع المصادر: "
+        + " | ".join(errors)
+    )
 
 
 def format_price(price: float) -> str:
@@ -128,8 +303,6 @@ def format_price(price: float) -> str:
 
 
 def build_post(price: float) -> str:
-    current_time = datetime.now().strftime("%H:%M:%S")
-
     return (
         f"💲 سعر TON بالدولار: {format_price(price)} $\n\n"
         f"$$$\n"
@@ -139,23 +312,25 @@ def build_post(price: float) -> str:
     )
 
 
-# =========================
-# تحويل الفاصل الزمني
-# =========================
+# =========================================================
+# الفاصل الزمني
+# =========================================================
 
-def parse_interval(value: str):
+def parse_interval(value: str) -> Optional[int]:
     """
-    أمثلة مقبولة:
-    30ث = 30 ثانية
-    3د  = 3 دقائق
-    2س  = ساعتان
-    1ي  = يوم واحد
+    الصيغ المدعومة:
+    30ث
+    3د
+    2س
+    1ي
     """
 
-    value = value.strip().lower()
-    value = value.replace(" ", "")
+    value = value.strip().lower().replace(" ", "")
 
-    match = re.fullmatch(r"(\d+(?:\.\d+)?)(ث|ثانية|د|دقيقة|س|ساعة|ي|يوم)", value)
+    match = re.fullmatch(
+        r"(\d+(?:\.\d+)?)(ث|ثانية|ثواني|د|دقيقة|دقائق|س|ساعة|ساعات|ي|يوم|أيام)",
+        value,
+    )
 
     if not match:
         return None
@@ -166,23 +341,24 @@ def parse_interval(value: str):
     if number <= 0:
         return None
 
-    if unit in ("ث", "ثانية"):
+    if unit in ("ث", "ثانية", "ثواني"):
         seconds = number
-    elif unit in ("د", "دقيقة"):
+    elif unit in ("د", "دقيقة", "دقائق"):
         seconds = number * 60
-    elif unit in ("س", "ساعة"):
+    elif unit in ("س", "ساعة", "ساعات"):
         seconds = number * 60 * 60
     else:
         seconds = number * 60 * 60 * 24
 
-    # حماية من الفواصل الصغيرة جدًا
-    if seconds < 10:
+    seconds = int(seconds)
+
+    if seconds < MIN_INTERVAL_SECONDS:
         return None
 
-    return int(seconds)
+    return seconds
 
 
-def interval_text(seconds: int) -> str:
+def format_interval(seconds: int) -> str:
     if seconds % 86400 == 0:
         return f"{seconds // 86400}ي"
 
@@ -195,358 +371,493 @@ def interval_text(seconds: int) -> str:
     return f"{seconds}ث"
 
 
-# =========================
+# =========================================================
 # لوحة التحكم
-# =========================
+# =========================================================
 
-def main_keyboard():
+def control_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton("▶️ تشغيل النشر", callback_data="start"),
-                InlineKeyboardButton("⏹ إيقاف النشر", callback_data="stop"),
+                InlineKeyboardButton(
+                    "▶️ تشغيل النشر",
+                    callback_data="publisher_start",
+                ),
+                InlineKeyboardButton(
+                    "⏹ إيقاف النشر",
+                    callback_data="publisher_stop",
+                ),
             ],
             [
-                InlineKeyboardButton("⏱ تحديد الفاصل", callback_data="interval"),
+                InlineKeyboardButton(
+                    "⏱ تحديد الفاصل",
+                    callback_data="set_interval",
+                ),
             ],
             [
-                InlineKeyboardButton("➕ إضافة قناة", callback_data="add_channel"),
-                InlineKeyboardButton("➖ حذف قناة", callback_data="remove_channel"),
+                InlineKeyboardButton(
+                    "➕ إضافة قناة",
+                    callback_data="add_channel",
+                ),
+                InlineKeyboardButton(
+                    "➖ حذف قناة",
+                    callback_data="remove_channel",
+                ),
             ],
             [
-                InlineKeyboardButton("📋 قنوات النشر", callback_data="list_channels"),
-            ],
-            [
-                InlineKeyboardButton("📊 الحالة", callback_data="status"),
+                InlineKeyboardButton(
+                    "📋 قنوات النشر",
+                    callback_data="list_channels",
+                ),
+                InlineKeyboardButton(
+                    "📊 الحالة",
+                    callback_data="status",
+                ),
             ],
         ]
     )
 
 
-async def send_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = (
-        "لوحة التحكم\n\n"
-        f"حالة النشر: {'يعمل ✅' if DATA['publishing'] else 'متوقف ⛔'}\n"
-        f"الفاصل: {interval_text(DATA['interval'])}\n"
-        f"عدد القنوات: {len(DATA['channels'])}\n\n"
-        "ملاحظة: @sn3nn حقوق نشر فقط، ولن يتم النشر فيها."
+def panel_text() -> str:
+    channels = get_channels()
+    state = "يعمل ✅" if is_publishing() else "متوقف ⛔"
+
+    return (
+        "🎛 لوحة التحكم\n\n"
+        f"حالة النشر: {state}\n"
+        f"الفاصل: {format_interval(get_interval())}\n"
+        f"عدد قنوات النشر: {len(channels)}\n\n"
+        f"ملاحظة: {RIGHTS_CHANNEL} حقوق فقط، "
+        "ولن يتم النشر فيها."
     )
+
+
+async def show_panel(update: Update) -> None:
+    text = panel_text()
 
     if update.callback_query:
         await update.callback_query.edit_message_text(
             text,
-            reply_markup=main_keyboard(),
+            reply_markup=control_keyboard(),
         )
     else:
         await update.effective_message.reply_text(
             text,
-            reply_markup=main_keyboard(),
+            reply_markup=control_keyboard(),
         )
 
 
-# =========================
-# أوامر البوت
-# =========================
+# =========================================================
+# التحقق من القناة
+# =========================================================
 
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await admin_only(update):
+def normalize_channel(value: str) -> Optional[str]:
+    value = value.strip()
+
+    if value == RIGHTS_CHANNEL:
+        return None
+
+    if value.startswith("@") and len(value) > 1:
+        return value
+
+    if re.fullmatch(r"-100\d+", value):
+        return value
+
+    return None
+
+
+async def verify_bot_can_publish(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: str,
+) -> tuple[bool, str, str]:
+    try:
+        chat = await context.bot.get_chat(chat_id)
+
+        member = await context.bot.get_chat_member(
+            chat.id,
+            context.bot.id,
+        )
+
+        if member.status not in (
+            ChatMemberStatus.ADMINISTRATOR,
+            ChatMemberStatus.OWNER,
+        ):
+            return (
+                False,
+                "",
+                "البوت ليس مشرفًا في القناة.",
+            )
+
+        if member.status == ChatMemberStatus.ADMINISTRATOR:
+            can_post = getattr(member, "can_post_messages", True)
+
+            if can_post is False:
+                return (
+                    False,
+                    "",
+                    "البوت مشرف، لكن لا يملك صلاحية نشر الرسائل.",
+                )
+
+        title = chat.title or str(chat.id)
+        return True, title, ""
+
+    except TelegramError as error:
+        return False, "", str(error)
+
+
+# =========================================================
+# النشر
+# =========================================================
+
+def remove_publisher_jobs(context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.job_queue:
         return
 
-    await send_panel(update, context)
+    for job in context.job_queue.get_jobs_by_name(JOB_NAME):
+        job.schedule_removal()
 
 
-async def id_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
+def start_publisher_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    remove_publisher_jobs(context)
 
-    await update.effective_message.reply_text(
-        f"رقم حسابك هو:\n{user.id}"
+    if not is_publishing() or not get_channels():
+        return
+
+    context.job_queue.run_repeating(
+        publish_job,
+        interval=get_interval(),
+        first=0,
+        name=JOB_NAME,
     )
 
 
-# =========================
-# التعامل مع الأزرار
-# =========================
-
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    if not await admin_only(update):
+async def publish_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_publishing():
         return
 
-    action = query.data
+    channels = get_channels()
 
-    if action == "start":
-        if not DATA["channels"]:
-            await query.edit_message_text(
-                "لا توجد قنوات للنشر.\n"
-                "أضف قناة أولًا، ثم اجعل البوت مشرفًا فيها.",
-                reply_markup=main_keyboard(),
-            )
-            return
-
-        DATA["publishing"] = True
-        save_data(DATA)
-
-        await restart_publisher(context)
-
-        await query.edit_message_text(
-            "✅ تم تشغيل النشر التلقائي.",
-            reply_markup=main_keyboard(),
-        )
-
-    elif action == "stop":
-        DATA["publishing"] = False
-        save_data(DATA)
-
-        stop_publisher(context)
-
-        await query.edit_message_text(
-            "⛔ تم إيقاف النشر التلقائي.",
-            reply_markup=main_keyboard(),
-        )
-
-    elif action == "interval":
-        context.user_data["awaiting"] = "interval"
-
-        await query.edit_message_text(
-            "أرسل الفاصل الزمني، مثل:\n\n"
-            "3د = كل 3 دقائق\n"
-            "30ث = كل 30 ثانية\n"
-            "2س = كل ساعتين\n"
-            "1ي = كل يوم",
-            reply_markup=main_keyboard(),
-        )
-
-    elif action == "add_channel":
-        context.user_data["awaiting"] = "add_channel"
-
-        await query.edit_message_text(
-            "أرسل معرف القناة المراد النشر فيها.\n\n"
-            "مثال:\n"
-            "@my_channel\n\n"
-            "أو أرسل رقم القناة الخاصة مثل:\n"
-            "-1001234567890\n\n"
-            "لا ترسل @sn3nn لأنها حقوق نشر فقط.",
-            reply_markup=main_keyboard(),
-        )
-
-    elif action == "remove_channel":
-        context.user_data["awaiting"] = "remove_channel"
-
-        await query.edit_message_text(
-            "أرسل معرف القناة المراد حذفها من قائمة النشر.",
-            reply_markup=main_keyboard(),
-        )
-
-    elif action == "list_channels":
-        channels = DATA["channels"]
-
-        if not channels:
-            text = "لا توجد قنوات مضافة حاليًا."
-        else:
-            lines = ["📋 قنوات النشر:\n"]
-
-            for index, channel in enumerate(channels, start=1):
-                lines.append(f"{index}. {channel}")
-
-            text = "\n".join(lines)
-
-        await query.edit_message_text(
-            text,
-            reply_markup=main_keyboard(),
-        )
-
-    elif action == "status":
-        status = "يعمل ✅" if DATA["publishing"] else "متوقف ⛔"
-
-        text = (
-            "📊 حالة البوت\n\n"
-            f"النشر: {status}\n"
-            f"الفاصل: {interval_text(DATA['interval'])}\n"
-            f"عدد القنوات: {len(DATA['channels'])}\n"
-            f"القناة المستثناة: {RIGHTS_CHANNEL}\n"
-        )
-
-        await query.edit_message_text(
-            text,
-            reply_markup=main_keyboard(),
-        )
-
-
-# =========================
-# استقبال إدخالات الإدارة
-# =========================
-
-async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await admin_only(update):
-        return
-
-    awaiting = context.user_data.get("awaiting")
-
-    if not awaiting:
-        return
-
-    value = update.effective_message.text.strip()
-    context.user_data.pop("awaiting", None)
-
-    if awaiting == "interval":
-        seconds = parse_interval(value)
-
-        if seconds is None:
-            await update.effective_message.reply_text(
-                "صيغة غير صحيحة.\n\n"
-                "استخدم مثلًا:\n"
-                "3د أو 30ث أو 2س أو 1ي\n"
-                "وأقل مدة مسموحة 10 ثوانٍ."
-            )
-            return
-
-        DATA["interval"] = seconds
-        save_data(DATA)
-
-        if DATA["publishing"]:
-            await restart_publisher(context)
-
-        await update.effective_message.reply_text(
-            f"✅ تم ضبط النشر كل {interval_text(seconds)}.",
-            reply_markup=main_keyboard(),
-        )
-
-    elif awaiting == "add_channel":
-        channel = value
-
-        if channel == RIGHTS_CHANNEL or channel.lstrip("-").isdigit() and channel == RIGHTS_CHANNEL:
-            await update.effective_message.reply_text(
-                "❌ لا يمكن إضافة @sn3nn للنشر؛ هذه القناة مخصصة للحقوق فقط."
-            )
-            return
-
-        if not channel.startswith("@") and not channel.lstrip("-").isdigit():
-            await update.effective_message.reply_text(
-                "❌ معرف القناة غير صحيح.\n"
-                "استخدم @channel أو رقم يبدأ بـ -100."
-            )
-            return
-
-        if channel in DATA["channels"]:
-            await update.effective_message.reply_text(
-                "القناة مضافة مسبقًا."
-            )
-            return
-
-        DATA["channels"].append(channel)
-        save_data(DATA)
-
-        await update.effective_message.reply_text(
-            f"✅ تمت إضافة القناة:\n{channel}\n\n"
-            "تأكد من إضافة البوت مشرفًا مع صلاحية نشر الرسائل.",
-            reply_markup=main_keyboard(),
-        )
-
-    elif awaiting == "remove_channel":
-        channel = value
-
-        if channel not in DATA["channels"]:
-            await update.effective_message.reply_text(
-                "القناة غير موجودة في قائمة النشر."
-            )
-            return
-
-        DATA["channels"].remove(channel)
-        save_data(DATA)
-
-        await update.effective_message.reply_text(
-            f"✅ تم حذف القناة:\n{channel}",
-            reply_markup=main_keyboard(),
-        )
-
-
-# =========================
-# النشر
-# =========================
-
-async def publish_to_channels(context: ContextTypes.DEFAULT_TYPE):
-    if not DATA["publishing"]:
-        return
-
-    if not DATA["channels"]:
+    if not channels:
+        logger.warning("لا توجد قنوات للنشر.")
         return
 
     try:
         price = await get_ton_price()
         message = build_post(price)
+
     except Exception as error:
-        print(f"خطأ في جلب سعر TON: {error}")
+        logger.exception("فشل جلب سعر TON: %s", error)
         return
 
-    failed_channels = []
+    for channel in channels:
+        chat_id = channel["chat_id"]
 
-    for channel in list(DATA["channels"]):
-        # حماية إضافية حتى لا يتم النشر في قناة الحقوق
-        if channel == RIGHTS_CHANNEL:
+        if chat_id == RIGHTS_CHANNEL:
             continue
 
         try:
             await context.bot.send_message(
-                chat_id=channel,
+                chat_id=chat_id,
                 text=message,
+                disable_web_page_preview=True,
             )
 
-            print(f"تم النشر في {channel}")
+            update_channel_success(chat_id)
+            logger.info("تم النشر في %s", chat_id)
 
-        except Exception as error:
-            print(f"فشل النشر في {channel}: {error}")
-            failed_channels.append(channel)
+        except TelegramError as error:
+            update_channel_error(chat_id, str(error))
+            logger.error(
+                "فشل النشر في %s: %s",
+                chat_id,
+                error,
+            )
 
-    if failed_channels:
-        print(
-            "تأكد من أن البوت مشرف في القنوات التالية "
-            "ولديه صلاحية نشر الرسائل:"
-        )
-        print(failed_channels)
-
-
-def stop_publisher(context: ContextTypes.DEFAULT_TYPE):
-    jobs = context.job_queue.get_jobs_by_name(PUBLISH_JOB_NAME)
-
-    for job in jobs:
-        job.schedule_removal()
+        # تأخير بسيط حتى لا ترسل الطلبات كلها في اللحظة نفسها
+        await asyncio.sleep(0.5)
 
 
-async def restart_publisher(context: ContextTypes.DEFAULT_TYPE):
-    stop_publisher(context)
+# =========================================================
+# الأوامر
+# =========================================================
 
-    if not DATA["publishing"]:
+async def start_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    if not await require_admin(update):
         return
 
-    context.job_queue.run_repeating(
-        publish_to_channels,
-        interval=DATA["interval"],
-        first=0,
-        name=PUBLISH_JOB_NAME,
+    await show_panel(update)
+
+
+async def id_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    if not update.effective_user:
+        return
+
+    await update.effective_message.reply_text(
+        f"رقم حسابك هو:\n{update.effective_user.id}"
     )
 
 
-async def post_init(application: Application):
-    if DATA["publishing"] and DATA["channels"]:
-        await restart_publisher(application)
+# =========================================================
+# الأزرار
+# =========================================================
 
+async def button_handler(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    query = update.callback_query
+    await query.answer()
 
-# =========================
-# التشغيل
-# =========================
+    if not await require_admin(update):
+        return
 
-def main():
-    if BOT_TOKEN == "ضع_توكن_البوت_هنا":
-        raise RuntimeError(
-            "ضع توكن البوت داخل متغير BOT_TOKEN قبل التشغيل."
+    action = query.data
+
+    if action == "publisher_start":
+        if not get_channels():
+            await query.edit_message_text(
+                "❌ لا توجد قنوات للنشر.\n"
+                "أضف قناة أولًا، واجعل البوت مشرفًا فيها.",
+                reply_markup=control_keyboard(),
+            )
+            return
+
+        set_setting("publishing", "1")
+        start_publisher_job(context)
+
+        await query.edit_message_text(
+            "✅ تم تشغيل النشر التلقائي.\n"
+            f"الفاصل الحالي: {format_interval(get_interval())}",
+            reply_markup=control_keyboard(),
         )
 
-    if ADMIN_USER_ID == 0:
-        raise RuntimeError(
-            "ضع رقم حسابك داخل ADMIN_USER_ID قبل التشغيل."
+    elif action == "publisher_stop":
+        set_setting("publishing", "0")
+        remove_publisher_jobs(context)
+
+        await query.edit_message_text(
+            "⛔ تم إيقاف النشر التلقائي.",
+            reply_markup=control_keyboard(),
         )
+
+    elif action == "set_interval":
+        context.user_data["waiting_for"] = "interval"
+
+        await query.edit_message_text(
+            "أرسل الفاصل الزمني فقط، مثل:\n\n"
+            "30ث = كل 30 ثانية\n"
+            "3د = كل 3 دقائق\n"
+            "2س = كل ساعتين\n"
+            "1ي = كل يوم\n\n"
+            f"أقل مدة مسموحة: {MIN_INTERVAL_SECONDS} ثوانٍ.",
+            reply_markup=control_keyboard(),
+        )
+
+    elif action == "add_channel":
+        context.user_data["waiting_for"] = "add_channel"
+
+        await query.edit_message_text(
+            "أرسل معرف القناة المراد النشر فيها.\n\n"
+            "مثال لقناة عامة:\n"
+            "@my_channel\n\n"
+            "أو رقم قناة خاصة:\n"
+            "-1001234567890\n\n"
+            f"ممنوع إضافة {RIGHTS_CHANNEL}؛ "
+            "لأنها حقوق فقط.",
+            reply_markup=control_keyboard(),
+        )
+
+    elif action == "remove_channel":
+        context.user_data["waiting_for"] = "remove_channel"
+
+        await query.edit_message_text(
+            "أرسل معرف القناة التي تريد حذفها من قائمة النشر.",
+            reply_markup=control_keyboard(),
+        )
+
+    elif action == "list_channels":
+        channels = get_channels()
+
+        if not channels:
+            text = "📋 لا توجد قنوات مضافة."
+        else:
+            lines = ["📋 قنوات النشر:\n"]
+
+            for index, channel in enumerate(channels, start=1):
+                title = channel["title"] or "بدون اسم"
+                lines.append(
+                    f"{index}. {title}\n"
+                    f"   المعرف: {channel['chat_id']}"
+                )
+
+            text = "\n".join(lines)
+
+        await query.edit_message_text(
+            text,
+            reply_markup=control_keyboard(),
+        )
+
+    elif action == "status":
+        channels = get_channels()
+        state = "يعمل ✅" if is_publishing() else "متوقف ⛔"
+
+        lines = [
+            "📊 حالة البوت\n",
+            f"النشر: {state}",
+            f"الفاصل: {format_interval(get_interval())}",
+            f"عدد القنوات: {len(channels)}",
+            f"حقوق النشر: {RIGHTS_CHANNEL}",
+        ]
+
+        for channel in channels:
+            if channel["last_error"]:
+                lines.append(
+                    f"\n⚠️ {channel['chat_id']}\n"
+                    f"آخر خطأ: {channel['last_error'][:300]}"
+                )
+
+        await query.edit_message_text(
+            "\n".join(lines),
+            reply_markup=control_keyboard(),
+        )
+
+
+# =========================================================
+# استقبال رسائل المالك
+# =========================================================
+
+async def text_handler(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    if not await require_admin(update):
+        return
+
+    waiting_for = context.user_data.get("waiting_for")
+
+    if not waiting_for:
+        return
+
+    value = update.effective_message.text.strip()
+    context.user_data.pop("waiting_for", None)
+
+    if waiting_for == "interval":
+        seconds = parse_interval(value)
+
+        if seconds is None:
+            await update.effective_message.reply_text(
+                "❌ الصيغة غير صحيحة.\n\n"
+                "أمثلة صحيحة:\n"
+                "30ث\n"
+                "3د\n"
+                "2س\n"
+                "1ي"
+            )
+            return
+
+        set_setting("interval", str(seconds))
+
+        if is_publishing():
+            start_publisher_job(context)
+
+        await update.effective_message.reply_text(
+            f"✅ تم ضبط النشر كل {format_interval(seconds)}.",
+            reply_markup=control_keyboard(),
+        )
+
+    elif waiting_for == "add_channel":
+        chat_id = normalize_channel(value)
+
+        if not chat_id:
+            await update.effective_message.reply_text(
+                f"❌ معرف القناة غير صحيح أو أنها {RIGHTS_CHANNEL}.\n\n"
+                "استخدم:\n"
+                "@channel_username\n"
+                "أو:\n"
+                "-1001234567890"
+            )
+            return
+
+        if get_channel(chat_id):
+            await update.effective_message.reply_text(
+                "⚠️ هذه القناة مضافة مسبقًا.",
+                reply_markup=control_keyboard(),
+            )
+            return
+
+        valid, title, error = await verify_bot_can_publish(
+            context,
+            chat_id,
+        )
+
+        if not valid:
+            await update.effective_message.reply_text(
+                "❌ تعذر إضافة القناة.\n\n"
+                f"السبب: {error}\n\n"
+                "تأكد من أن البوت موجود في القناة "
+                "ومشرف ويملك صلاحية نشر الرسائل."
+            )
+            return
+
+        add_channel(chat_id, title)
+
+        await update.effective_message.reply_text(
+            f"✅ تمت إضافة القناة بنجاح:\n"
+            f"{title}\n"
+            f"{chat_id}",
+            reply_markup=control_keyboard(),
+        )
+
+    elif waiting_for == "remove_channel":
+        chat_id = normalize_channel(value)
+
+        if not chat_id or not get_channel(chat_id):
+            await update.effective_message.reply_text(
+                "❌ هذه القناة غير موجودة في قائمة النشر."
+            )
+            return
+
+        remove_channel(chat_id)
+
+        if not get_channels():
+            set_setting("publishing", "0")
+            remove_publisher_jobs(context)
+
+        await update.effective_message.reply_text(
+            f"✅ تم حذف القناة:\n{chat_id}",
+            reply_markup=control_keyboard(),
+        )
+
+
+# =========================================================
+# بدء التطبيق
+# =========================================================
+
+async def post_init(application: Application) -> None:
+    init_database()
+
+    if is_publishing() and get_channels():
+        start_publisher_job(application)
+
+
+def main() -> None:
+    if not BOT_TOKEN:
+        raise RuntimeError(
+            "ضع توكن البوت في المتغير BOT_TOKEN."
+        )
+
+    if ADMIN_USER_ID <= 0:
+        raise RuntimeError(
+            "ضع رقم حسابك في المتغير ADMIN_USER_ID."
+        )
+
+    init_database()
 
     application = (
         Application.builder()
@@ -555,9 +866,15 @@ def main():
         .build()
     )
 
-    application.add_handler(CommandHandler("start", start_command))
-    application.add_handler(CommandHandler("id", id_command))
-    application.add_handler(CallbackQueryHandler(button_handler))
+    application.add_handler(
+        CommandHandler("start", start_command)
+    )
+    application.add_handler(
+        CommandHandler("id", id_command)
+    )
+    application.add_handler(
+        CallbackQueryHandler(button_handler)
+    )
     application.add_handler(
         MessageHandler(
             filters.TEXT & ~filters.COMMAND,
@@ -565,8 +882,10 @@ def main():
         )
     )
 
-    print("Bot is running...")
-    application.run_polling()
+    logger.info("تم تشغيل البوت.")
+    application.run_polling(
+        allowed_updates=Update.ALL_TYPES
+    )
 
 
 if __name__ == "__main__":
