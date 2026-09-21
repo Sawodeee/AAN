@@ -1,8 +1,8 @@
 """
 ================================================================================
-   اسم البوت: البوت الشامل والمتكامل لإدارة القنوات والعملات الرقمية (TON & Gram)
-   المطور: @J_6_K
-   الإصدار: 2026 النهائي (النسخة المطورة والخالية من الأخطاء)
+    اسم البوت: البوت الشامل والمتكامل لإدارة القنوات والعملات الرقمية (TON & Gram)
+    المطور: @J_6_K
+    الإصدار: 2026 النهائي (النسخة المطورة والخالية من الأخطاء)
 ================================================================================
 """
 
@@ -26,8 +26,8 @@ from telebot.types import (
 # ==============================================================================
 # 1. إعدادات النظام ومتغيرات البيئة والتوكن الأساسي
 # ==============================================================================
-API_TOKEN = ""
-OWNER_ID = 105405258
+API_TOKEN = os.getenv("BOT_TOKEN", "")
+OWNER_ID = int(os.getenv("ADMIN_USER_ID", "105405258"))
 BOT_OWNER_USERNAME = "J_6_K"
 CHANNEL_USERNAME = "@J_6_K"
 
@@ -129,17 +129,22 @@ def is_admin(user_obj):
     stored_admins = load_data("admins", [])
     return current_username in [str(a).lower().replace("@", "") for a in stored_admins]
 
+
 def is_blocked(user_id):
     return user_id in load_data("blocked", [])
+
 
 def get_bot_mode():
     return load_data("mode", "public")
 
+
 def get_notifications_status():
     return load_data("notifications", "enabled") == "enabled"
 
+
 def get_auto_publish_status():
     return load_data("auto_publish", "disabled") == "enabled"
+
 
 def get_timer_minutes():
     try:
@@ -165,6 +170,7 @@ def get_ton_and_gram_prices():
         logger.error(f"خطأ جلب الأسعار: {e}")
     return 5.5, 1.1
 
+
 def get_channel_post_keyboard():
     markup = InlineKeyboardMarkup()
     btn_custom = load_data("custom_btn", {"text": "📡 قناتنا الرسمية", "url": f"https://t.me/{BOT_OWNER_USERNAME}"})
@@ -173,6 +179,7 @@ def get_channel_post_keyboard():
         InlineKeyboardButton(btn_custom["text"], url=btn_custom["url"])
     )
     return markup
+
 
 def broadcast_prices_to_all_channels():
     ton, gram = get_ton_and_gram_prices()
@@ -189,6 +196,7 @@ def broadcast_prices_to_all_channels():
             logger.error(f"خطأ النشر للقناة {ch}: {e}")
     return True
 
+
 def background_auto_publisher_daemon():
     while True:
         try:
@@ -198,6 +206,7 @@ def background_auto_publisher_daemon():
         except Exception as e:
             logger.error(f"خطأ خيط النشر الخلفي: {e}")
             time.sleep(60)
+
 
 threading.Thread(target=background_auto_publisher_daemon, daemon=True).start()
 
@@ -217,12 +226,13 @@ def get_main_reply_keyboard(user):
         markup.add(KeyboardButton("🛠️ لوحة تحكم المشرفين"))
     return markup
 
+
 def get_admin_inline_control_panel():
     notif_label = "الإشعارات: مفعلة 🟢" if get_notifications_status() else "الإشعارات: معطلة 🔴"
     mode_label = "🌐 الوضع: مفتوح" if get_bot_mode() == "public" else "🔒 الوضع: مشرفين فقط"
     auto_label = "🔄 النشر التلقائي: مفعل 🟢" if get_auto_publish_status() else "🔄 النشر التلقائي: معطل 🔴"
     timer_val = get_timer_minutes()
-    
+
     markup = InlineKeyboardMarkup(row_width=2)
     markup.add(InlineKeyboardButton("📈 جلب الأسعار الفوري", callback_data="status_ch"), InlineKeyboardButton("📡 إدارة القنوات", callback_data="manage_channels"))
     markup.add(InlineKeyboardButton(auto_label, callback_data="toggle_auto_publish"), InlineKeyboardButton(f"⏳ المؤقت: {timer_val}د", callback_data="edit_timer"))
@@ -242,7 +252,7 @@ def start_cmd(message: Message):
     user = message.from_user
     if is_blocked(user.id):
         return
-    
+
     users = load_data("users", [])
     if user.id not in users:
         users.append(user.id)
@@ -254,6 +264,7 @@ def start_cmd(message: Message):
 
     welcome_msg = load_data("welcome", f"أهلاً بك يا {user.first_name} في بوت أسعار العملات الرقمية المتطور 🚀")
     bot.send_message(message.chat.id, welcome_msg, reply_markup=get_main_reply_keyboard(user), parse_mode="Markdown")
+
 
 @bot.message_handler(commands=['id', 'stats', 'ping', 'help', 'prices'])
 def utility_cmds(message: Message):
@@ -274,6 +285,7 @@ def utility_cmds(message: Message):
     elif cmd == "/prices":
         ton, gram = get_ton_and_gram_prices()
         bot.reply_to(message, f"💎 TON: `${ton}`\n🔸 Gram: `${gram}`", parse_mode="Markdown", reply_markup=get_channel_post_keyboard())
+
 
 @bot.message_handler(func=lambda m: True, content_types=['text', 'photo', 'video', 'document', 'audio', 'sticker'])
 def message_handler(message: Message):
@@ -298,20 +310,22 @@ def message_handler(message: Message):
         elif state == "wait_broadcast":
             success_count = 0
             for u in load_data("users", []):
-                try: 
+                try:
                     bot.copy_message(u, message.chat.id, message.message_id)
                     success_count += 1
-                except: pass
+                except Exception:
+                    pass
             for ch in load_data("channels", []):
-                try: 
+                try:
                     bot.copy_message(ch, message.chat.id, message.message_id, reply_markup=get_channel_post_keyboard())
-                except: pass
+                except Exception:
+                    pass
             bot.reply_to(message, f"✅ تمت الإذاعة بنجاح إلى المستخدمين والقنوات.", reply_markup=get_main_reply_keyboard(user))
             del user_state[uid]
             return
         elif state == "wait_welcome":
             save_data("welcome", text)
-            bot.reply_to(message, "✅ تم تحديث رسالة الترحيب بنجاح.", reply_markup=get_main_reply_keyboard(user))
+            bot.reply_to(message, "✅ تم تحديث رسالة التر��يب بنجاح.", reply_markup=get_main_reply_keyboard(user))
             del user_state[uid]
             return
 
@@ -321,15 +335,17 @@ def message_handler(message: Message):
     elif text == "📡 قناتنا الرسمية":
         bot.send_message(message.chat.id, f"قناتنا الرسمية: {CHANNEL_USERNAME}")
     elif text == "📢 نشر منشور جديد لكل القنوات":
-        if not is_admin(user): return
+        if not is_admin(user):
+            return
         user_pending_posts[uid] = message
         bot.send_message(message.chat.id, "✍️ أرسل المنشور المراد تعميمه على كافة القنوات:")
     elif text == "📊 الإحصائيات السريعة":
-        bot.send_message(message.chat.id, f"📊 إحصائيات البوت:\n- المشتركين: {len(load_data('users', []))}\n- القنوات المضافة: {len(load_data('channels', []))}", parse_mode="Markdown")
+        bot.send_message(message.chat.id, f"📊 إحصائيات البوت:\n- المشتركين: {len(load_data('users', []))}\n- القنوات المضافة: {len(load_data('channels', []))}\n- المحظورين: {len(load_data('blocked', []))}")
     elif text == "🆔 آيدي":
         bot.send_message(message.chat.id, f"🆔 الآيدي الخاص بك: `{uid}`", parse_mode="Markdown")
     elif text == "🛠️ لوحة تحكم المشرفين":
-        if not is_admin(user): return
+        if not is_admin(user):
+            return
         bot.send_message(message.chat.id, "🛠️ لوحة التحكم الإدارية المتطورة:", reply_markup=get_admin_inline_control_panel())
 
 # ==============================================================================
@@ -348,10 +364,10 @@ def callbacks(c):
             ton, gram = get_ton_and_gram_prices()
             try:
                 bot.edit_message_text(
-                    f"💎 **تقرير أسعار العملات الرقمية المباشر:**\n\n🔹 **TON:** `${ton}`\n🔸 **Gram:** `${gram}`", 
-                    c.message.chat.id, 
-                    c.message.message_id, 
-                    parse_mode="Markdown", 
+                    f"💎 **تقرير أسعار العملات الرقمية المباشر:**\n\n🔹 **TON:** `${ton}`\n🔸 **Gram:** `${gram}`",
+                    c.message.chat.id,
+                    c.message.message_id,
+                    parse_mode="Markdown",
                     reply_markup=get_channel_post_keyboard()
                 )
             except Exception:
@@ -364,9 +380,9 @@ def callbacks(c):
                 return
             try:
                 bot.edit_message_text(
-                    "🛠️ لوحة التحكم الإدارية المتطورة:", 
-                    c.message.chat.id, 
-                    c.message.message_id, 
+                    "🛠️ لوحة التحكم الإدارية المتطورة:",
+                    c.message.chat.id,
+                    c.message.message_id,
                     reply_markup=get_admin_inline_control_panel()
                 )
             except Exception:
@@ -382,7 +398,7 @@ def callbacks(c):
             bot.answer_callback_query(c.id)
 
         elif data == "manage_channels":
-            if not is_admin(user): 
+            if not is_admin(user):
                 return
             markup = InlineKeyboardMarkup()
             markup.add(
@@ -412,8 +428,8 @@ def callbacks(c):
             save_data("auto_publish", "disabled" if current_status else "enabled")
             try:
                 bot.edit_message_reply_markup(
-                    c.message.chat.id, 
-                    c.message.message_id, 
+                    c.message.chat.id,
+                    c.message.message_id,
                     reply_markup=get_admin_inline_control_panel()
                 )
             except Exception:
@@ -426,8 +442,8 @@ def callbacks(c):
             save_data("mode", new_mode)
             try:
                 bot.edit_message_reply_markup(
-                    c.message.chat.id, 
-                    c.message.message_id, 
+                    c.message.chat.id,
+                    c.message.message_id,
                     reply_markup=get_admin_inline_control_panel()
                 )
             except Exception:
@@ -440,8 +456,8 @@ def callbacks(c):
             save_data("notifications", new_notif)
             try:
                 bot.edit_message_reply_markup(
-                    c.message.chat.id, 
-                    c.message.message_id, 
+                    c.message.chat.id,
+                    c.message.message_id,
                     reply_markup=get_admin_inline_control_panel()
                 )
             except Exception:
@@ -475,8 +491,7 @@ def callbacks(c):
 
         elif data == "status_ch":
             ton, gram = get_ton_and_gram_prices()
-            # تم تأمين النص بالكامل بدون أي أقواس أو علامات قد تسبب أخطاء
-            bot.answer_callback_query(c.id, f"TON: {ton}$\vert{} Gram: {gram}$", show_alert=True)
+            bot.answer_callback_query(c.id, f"TON: {ton} $ | Gram: {gram} $", show_alert=True)
 
         else:
             bot.answer_callback_query(c.id, "⚙️ الزر يعمل بنجاح.")
@@ -485,7 +500,7 @@ def callbacks(c):
         logger.error(f"خطأ في معالجة الزر {data}: {err}")
         try:
             bot.answer_callback_query(c.id, "حدث خطأ مؤقت، حاول لاحقاً.", show_alert=False)
-        except:
+        except Exception:
             pass
 
 # ==============================================================================
