@@ -2,26 +2,53 @@ name: Run Telegram Bot
 
 on:
   push:
+    branches:
+      - main
   workflow_dispatch:
-  schedule:
-    - cron: '*/10 * * * *'
+
+concurrency:
+  group: telegram-bot-main
+  cancel-in-progress: true
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 350
+
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version: "3.11"
+          cache: pip
 
       - name: Install dependencies
         run: |
-          pip install python-telegram-bot httpx python-dotenv
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
 
-      - name: Run Bot
+      - name: Check required secrets
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          ADMIN_USER_ID: ${{ secrets.ADMIN_USER_ID }}
         run: |
-          python bot.py
+          if [ -z "$BOT_TOKEN" ]; then
+            echo "BOT_TOKEN غير موجود في Secrets"
+            exit 1
+          fi
+
+          if [ -z "$ADMIN_USER_ID" ]; then
+            echo "ADMIN_USER_ID غير موجود في Secrets"
+            exit 1
+          fi
+
+          echo "تم العثور على الأسرار المطلوبة."
+
+      - name: Run Telegram Bot
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          ADMIN_USER_ID: ${{ secrets.ADMIN_USER_ID }}
+        run: python bot.py
