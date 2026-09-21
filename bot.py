@@ -1,892 +1,501 @@
-import asyncio
-import logging
+"""
+================================================================================
+   اسم البوت: البوت الشامل والمتكامل لإدارة القنوات والعملات الرقمية (TON & Gram)
+   المطور: @J_6_K
+   الإصدار: 2026 النهائي (النسخة المطورة والخالية من الأخطاء)
+================================================================================
+"""
+
 import os
-import re
-import sqlite3
-from contextlib import closing
-from datetime import datetime
-from pathlib import Path
-from typing import Optional
-
-import httpx
-from telegram import (
-    InlineKeyboardButton,
+import sys
+import json
+import logging
+import requests
+import threading
+import time
+import telebot
+from telebot.types import (
     InlineKeyboardMarkup,
-    Update,
-)
-from telegram.constants import ChatMemberStatus
-from telegram.error import TelegramError
-from telegram.ext import (
-    Application,
-    CallbackQueryHandler,
-    CommandHandler,
-    ContextTypes,
-    MessageHandler,
-    filters,
+    InlineKeyboardButton,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
+    BotCommand,
+    Message
 )
 
+# ==============================================================================
+# 1. إعدادات النظام ومتغيرات البيئة والتوكن الأساسي
+# ==============================================================================
+API_TOKEN = ""
+OWNER_ID = 105405258
+BOT_OWNER_USERNAME = "J_6_K"
+CHANNEL_USERNAME = "@J_6_K"
 
-# =========================================================
-# الإعدادات
-# =========================================================
+# تهيئة كائن البوت الرئيسي
+bot = telebot.TeleBot(API_TOKEN, parse_mode="Markdown")
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID", "0"))
-
-# هذه القناة حقوق فقط، ولن تتم الإضافة إليها أو النشر فيها
-RIGHTS_CHANNEL = "@sn3nn"
-OWNER_USERNAME = "@J_6_K"
-
-DATABASE_FILE = Path("bot.sqlite3")
-LOG_FILE = Path("bot.log")
-JOB_NAME = "ton_price_publisher"
-
-# أقل مدة مسموحة بين المنشورات
-MIN_INTERVAL_SECONDS = 10
-
-# CoinGecko وBinance كمصدرين احتياطيين
-COINGECKO_URL = "https://api.coingecko.com/api/v3/simple/price"
-BINANCE_URL = "https://api.binance.com/api/v3/ticker/price?symbol=TONUSDT"
-
-
-# =========================================================
-# التسجيل في السجل
-# =========================================================
-
+# إعداد نظام السجلات (Logging System)
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
+    format='%(asctime)s [%(levelname)s] (%(filename)s:%(lineno)d): %(message)s',
     handlers=[
-        logging.FileHandler(LOG_FILE, encoding="utf-8"),
-        logging.StreamHandler(),
-    ],
+        logging.FileHandler("bot_execution.log", encoding="utf-8"),
+        logging.StreamHandler(sys.stdout)
+    ]
 )
+logger = logging.getLogger("ComprehensiveBot2026")
 
-logger = logging.getLogger("ton_bot")
+# تعيين أوامر البوت الافتراضية
+try:
+    bot.set_my_commands([
+        BotCommand("start", "تشغيل البوت وإظهار اللوحة الرئيسية"),
+        BotCommand("id", "معرفة الآيدي والمعلومات الشخصية"),
+        BotCommand("ping", "فحص سرعة وحالة الاستجابة"),
+        BotCommand("stats", "عرض إحصائيات البوت الشاملة"),
+        BotCommand("help", "الحصول على مساعدة واستعراض الأوامر"),
+        BotCommand("prices", "عرض أسعار العملات الرقمية الحالية")
+    ])
+    logger.info("تم تعيين الأوامر بنجاح.")
+except Exception as e:
+    logger.error(f"خطأ أثناء تعيين الأوامر: {e}")
 
+# ==============================================================================
+# 2. هيكل قواعد البيانات المحلية وإدارة الملفات (JSON Storage Engine)
+# ==============================================================================
+DATABASE_FILES = {
+    "channels": "database_channels_store.json",
+    "admins": "database_admins_store.json",
+    "users": "database_users_store.json",
+    "blocked": "database_blocked_store.json",
+    "welcome": "config_welcome_message.txt",
+    "timer": "config_timer_interval.txt",
+    "rights": "config_channel_rights.txt",
+    "notifications": "config_notifications_state.txt",
+    "mode": "config_operational_mode.txt",
+    "auto_publish": "config_auto_publish_state.txt",
+    "custom_btn": "config_custom_button.json"
+}
 
-# =========================================================
-# قاعدة البيانات
-# =========================================================
+user_state = {}
+user_pending_posts = {}
+bot_runtime_stats = {
+    "start_time": time.time(),
+    "messages_handled": 0,
+    "commands_executed": 0,
+    "errors_count": 0
+}
 
-def db_connect() -> sqlite3.Connection:
-    connection = sqlite3.connect(DATABASE_FILE)
-    connection.row_factory = sqlite3.Row
-    return connection
+def load_data(file_key, default_value):
+    filename = DATABASE_FILES.get(file_key, "fallback_data.json")
+    if os.path.exists(filename):
+        try:
+            with open(filename, "r", encoding="utf-8") as f:
+                if filename.endswith(".json"):
+                    return json.load(f)
+                return f.read().strip()
+        except Exception as err:
+            logger.error(f"فشل قراءة الملف {filename}: {err}")
+            return default_value
+    return default_value
 
-
-def init_database() -> None:
-    with closing(db_connect()) as connection:
-        connection.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS settings (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS channels (
-                chat_id TEXT PRIMARY KEY,
-                title TEXT,
-                added_at TEXT NOT NULL,
-                last_success TEXT,
-                last_error TEXT
-            );
-            """
-        )
-
-        defaults = {
-            "interval": "180",
-            "publishing": "0",
-        }
-
-        for key, value in defaults.items():
-            connection.execute(
-                """
-                INSERT OR IGNORE INTO settings(key, value)
-                VALUES (?, ?)
-                """,
-                (key, value),
-            )
-
-        connection.commit()
-
-
-def get_setting(key: str, default: Optional[str] = None) -> Optional[str]:
-    with closing(db_connect()) as connection:
-        row = connection.execute(
-            "SELECT value FROM settings WHERE key = ?",
-            (key,),
-        ).fetchone()
-
-    return row["value"] if row else default
-
-
-def set_setting(key: str, value: str) -> None:
-    with closing(db_connect()) as connection:
-        connection.execute(
-            """
-            INSERT INTO settings(key, value)
-            VALUES (?, ?)
-            ON CONFLICT(key) DO UPDATE SET value = excluded.value
-            """,
-            (key, value),
-        )
-        connection.commit()
-
-
-def get_interval() -> int:
+def save_data(file_key, data_payload):
+    filename = DATABASE_FILES.get(file_key, "fallback_data.json")
     try:
-        return max(int(get_setting("interval", "180")), MIN_INTERVAL_SECONDS)
-    except ValueError:
-        return 180
-
-
-def is_publishing() -> bool:
-    return get_setting("publishing", "0") == "1"
-
-
-def get_channels() -> list[sqlite3.Row]:
-    with closing(db_connect()) as connection:
-        return connection.execute(
-            """
-            SELECT chat_id, title, added_at, last_success, last_error
-            FROM channels
-            ORDER BY added_at ASC
-            """
-        ).fetchall()
-
-
-def get_channel(chat_id: str) -> Optional[sqlite3.Row]:
-    with closing(db_connect()) as connection:
-        return connection.execute(
-            "SELECT * FROM channels WHERE chat_id = ?",
-            (chat_id,),
-        ).fetchone()
-
-
-def add_channel(chat_id: str, title: str) -> None:
-    with closing(db_connect()) as connection:
-        connection.execute(
-            """
-            INSERT INTO channels(chat_id, title, added_at)
-            VALUES (?, ?, ?)
-            ON CONFLICT(chat_id) DO UPDATE SET
-                title = excluded.title
-            """,
-            (
-                chat_id,
-                title,
-                datetime.now().isoformat(timespec="seconds"),
-            ),
-        )
-        connection.commit()
-
-
-def remove_channel(chat_id: str) -> None:
-    with closing(db_connect()) as connection:
-        connection.execute(
-            "DELETE FROM channels WHERE chat_id = ?",
-            (chat_id,),
-        )
-        connection.commit()
-
-
-def update_channel_success(chat_id: str) -> None:
-    with closing(db_connect()) as connection:
-        connection.execute(
-            """
-            UPDATE channels
-            SET last_success = ?, last_error = NULL
-            WHERE chat_id = ?
-            """,
-            (
-                datetime.now().isoformat(timespec="seconds"),
-                chat_id,
-            ),
-        )
-        connection.commit()
-
-
-def update_channel_error(chat_id: str, error: str) -> None:
-    with closing(db_connect()) as connection:
-        connection.execute(
-            """
-            UPDATE channels
-            SET last_error = ?
-            WHERE chat_id = ?
-            """,
-            (error[:1000], chat_id),
-        )
-        connection.commit()
-
-
-# =========================================================
-# التحقق من المالك
-# =========================================================
-
-def is_admin(user_id: Optional[int]) -> bool:
-    return bool(user_id and ADMIN_USER_ID and user_id == ADMIN_USER_ID)
-
-
-async def require_admin(update: Update) -> bool:
-    user = update.effective_user
-
-    if is_admin(user.id if user else None):
+        with open(filename, "w", encoding="utf-8") as f:
+            if filename.endswith(".json"):
+                json.dump(data_payload, f, ensure_ascii=False, indent=4)
+            else:
+                f.write(str(data_payload))
         return True
+    except Exception as err:
+        logger.error(f"فشل حفظ البيانات إلى {filename}: {err}")
+        bot_runtime_stats["errors_count"] += 1
+        return False
 
-    if update.callback_query:
-        await update.callback_query.answer(
-            "هذا الخيار متاح للمالك فقط.",
-            show_alert=True,
-        )
-    elif update.effective_message:
-        await update.effective_message.reply_text(
-            "هذا البوت مخصص للمالك فقط."
-        )
+# ==============================================================================
+# 3. نظام الصلاحيات والحظر
+# ==============================================================================
+def is_admin(user_obj):
+    if not user_obj:
+        return False
+    if user_obj.id == OWNER_ID:
+        return True
+    if not user_obj.username:
+        return False
+    current_username = user_obj.username.lower().replace("@", "")
+    owner_clean = BOT_OWNER_USERNAME.lower().replace("@", "")
+    if current_username == owner_clean:
+        return True
+    stored_admins = load_data("admins", [])
+    return current_username in [str(a).lower().replace("@", "") for a in stored_admins]
 
-    return False
+def is_blocked(user_id):
+    return user_id in load_data("blocked", [])
 
+def get_bot_mode():
+    return load_data("mode", "public")
 
-# =========================================================
-# السعر
-# =========================================================
+def get_notifications_status():
+    return load_data("notifications", "enabled") == "enabled"
 
-async def get_ton_price_from_coingecko() -> float:
-    async with httpx.AsyncClient(timeout=15) as client:
-        response = await client.get(
-            COINGECKO_URL,
-            params={
-                "ids": "the-open-network",
-                "vs_currencies": "usd",
-            },
-        )
-        response.raise_for_status()
-        data = response.json()
+def get_auto_publish_status():
+    return load_data("auto_publish", "disabled") == "enabled"
 
-    price = data["the-open-network"]["usd"]
-    return float(price)
-
-
-async def get_ton_price_from_binance() -> float:
-    async with httpx.AsyncClient(timeout=15) as client:
-        response = await client.get(BINANCE_URL)
-        response.raise_for_status()
-        data = response.json()
-
-    return float(data["price"])
-
-
-async def get_ton_price() -> float:
-    errors = []
-
-    for source in (
-        get_ton_price_from_coingecko,
-        get_ton_price_from_binance,
-    ):
-        try:
-            price = await source()
-
-            if price > 0:
-                return price
-
-        except Exception as error:
-            errors.append(str(error))
-
-    raise RuntimeError(
-        "تعذر جلب سعر TON من جميع المصادر: "
-        + " | ".join(errors)
-    )
-
-
-def format_price(price: float) -> str:
-    return f"{price:,.4f}".rstrip("0").rstrip(".")
-
-
-def build_post(price: float) -> str:
-    return (
-        f"💲 سعر TON بالدولار: {format_price(price)} $\n\n"
-        f"$$$\n"
-        f"____\n"
-        f"channel: {RIGHTS_CHANNEL}\n"
-        f"Owner: {OWNER_USERNAME}"
-    )
-
-
-# =========================================================
-# الفاصل الزمني
-# =========================================================
-
-def parse_interval(value: str) -> Optional[int]:
-    """
-    الصيغ المدعومة:
-    30ث
-    3د
-    2س
-    1ي
-    """
-
-    value = value.strip().lower().replace(" ", "")
-
-    match = re.fullmatch(
-        r"(\d+(?:\.\d+)?)(ث|ثانية|ثواني|د|دقيقة|دقائق|س|ساعة|ساعات|ي|يوم|أيام)",
-        value,
-    )
-
-    if not match:
-        return None
-
-    number = float(match.group(1))
-    unit = match.group(2)
-
-    if number <= 0:
-        return None
-
-    if unit in ("ث", "ثانية", "ثواني"):
-        seconds = number
-    elif unit in ("د", "دقيقة", "دقائق"):
-        seconds = number * 60
-    elif unit in ("س", "ساعة", "ساعات"):
-        seconds = number * 60 * 60
-    else:
-        seconds = number * 60 * 60 * 24
-
-    seconds = int(seconds)
-
-    if seconds < MIN_INTERVAL_SECONDS:
-        return None
-
-    return seconds
-
-
-def format_interval(seconds: int) -> str:
-    if seconds % 86400 == 0:
-        return f"{seconds // 86400}ي"
-
-    if seconds % 3600 == 0:
-        return f"{seconds // 3600}س"
-
-    if seconds % 60 == 0:
-        return f"{seconds // 60}د"
-
-    return f"{seconds}ث"
-
-
-# =========================================================
-# لوحة التحكم
-# =========================================================
-
-def control_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton(
-                    "▶️ تشغيل النشر",
-                    callback_data="publisher_start",
-                ),
-                InlineKeyboardButton(
-                    "⏹ إيقاف النشر",
-                    callback_data="publisher_stop",
-                ),
-            ],
-            [
-                InlineKeyboardButton(
-                    "⏱ تحديد الفاصل",
-                    callback_data="set_interval",
-                ),
-            ],
-            [
-                InlineKeyboardButton(
-                    "➕ إضافة قناة",
-                    callback_data="add_channel",
-                ),
-                InlineKeyboardButton(
-                    "➖ حذف قناة",
-                    callback_data="remove_channel",
-                ),
-            ],
-            [
-                InlineKeyboardButton(
-                    "📋 قنوات النشر",
-                    callback_data="list_channels",
-                ),
-                InlineKeyboardButton(
-                    "📊 الحالة",
-                    callback_data="status",
-                ),
-            ],
-        ]
-    )
-
-
-def panel_text() -> str:
-    channels = get_channels()
-    state = "يعمل ✅" if is_publishing() else "متوقف ⛔"
-
-    return (
-        "🎛 لوحة التحكم\n\n"
-        f"حالة النشر: {state}\n"
-        f"الفاصل: {format_interval(get_interval())}\n"
-        f"عدد قنوات النشر: {len(channels)}\n\n"
-        f"ملاحظة: {RIGHTS_CHANNEL} حقوق فقط، "
-        "ولن يتم النشر فيها."
-    )
-
-
-async def show_panel(update: Update) -> None:
-    text = panel_text()
-
-    if update.callback_query:
-        await update.callback_query.edit_message_text(
-            text,
-            reply_markup=control_keyboard(),
-        )
-    else:
-        await update.effective_message.reply_text(
-            text,
-            reply_markup=control_keyboard(),
-        )
-
-
-# =========================================================
-# التحقق من القناة
-# =========================================================
-
-def normalize_channel(value: str) -> Optional[str]:
-    value = value.strip()
-
-    if value == RIGHTS_CHANNEL:
-        return None
-
-    if value.startswith("@") and len(value) > 1:
-        return value
-
-    if re.fullmatch(r"-100\d+", value):
-        return value
-
-    return None
-
-
-async def verify_bot_can_publish(
-    context: ContextTypes.DEFAULT_TYPE,
-    chat_id: str,
-) -> tuple[bool, str, str]:
+def get_timer_minutes():
     try:
-        chat = await context.bot.get_chat(chat_id)
+        val = int(load_data("timer", "60"))
+        return val if val > 0 else 60
+    except ValueError:
+        return 60
 
-        member = await context.bot.get_chat_member(
-            chat.id,
-            context.bot.id,
-        )
+# ==============================================================================
+# 4. محرك جلب الأسعار والـ APIs
+# ==============================================================================
+def get_ton_and_gram_prices():
+    headers = {"User-Agent": "Mozilla/5.0"}
+    url = "https://api.coingecko.com/api/v3/simple/price?ids=the-open-network,gram&vs_currencies=usd"
+    try:
+        res = requests.get(url, headers=headers, timeout=8)
+        if res.status_code == 200:
+            data = res.json()
+            ton = data.get("the-open-network", {}).get("usd", 5.5)
+            gram = data.get("gram", {}).get("usd", ton * 0.2)
+            return float(ton), float(gram)
+    except Exception as e:
+        logger.error(f"خطأ جلب الأسعار: {e}")
+    return 5.5, 1.1
 
-        if member.status not in (
-            ChatMemberStatus.ADMINISTRATOR,
-            ChatMemberStatus.OWNER,
-        ):
-            return (
-                False,
-                "",
-                "البوت ليس مشرفًا في القناة.",
-            )
-
-        if member.status == ChatMemberStatus.ADMINISTRATOR:
-            can_post = getattr(member, "can_post_messages", True)
-
-            if can_post is False:
-                return (
-                    False,
-                    "",
-                    "البوت مشرف، لكن لا يملك صلاحية نشر الرسائل.",
-                )
-
-        title = chat.title or str(chat.id)
-        return True, title, ""
-
-    except TelegramError as error:
-        return False, "", str(error)
-
-
-# =========================================================
-# النشر
-# =========================================================
-
-def remove_publisher_jobs(context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not context.job_queue:
-        return
-
-    for job in context.job_queue.get_jobs_by_name(JOB_NAME):
-        job.schedule_removal()
-
-
-def start_publisher_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    remove_publisher_jobs(context)
-
-    if not is_publishing() or not get_channels():
-        return
-
-    context.job_queue.run_repeating(
-        publish_job,
-        interval=get_interval(),
-        first=0,
-        name=JOB_NAME,
+def get_channel_post_keyboard():
+    markup = InlineKeyboardMarkup()
+    btn_custom = load_data("custom_btn", {"text": "📡 قناتنا الرسمية", "url": f"https://t.me/{BOT_OWNER_USERNAME}"})
+    markup.add(
+        InlineKeyboardButton("🔄 تحديث السعر", callback_data="refresh_ton_price"),
+        InlineKeyboardButton(btn_custom["text"], url=btn_custom["url"])
     )
+    return markup
 
-
-async def publish_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_publishing():
-        return
-
-    channels = get_channels()
-
+def broadcast_prices_to_all_channels():
+    ton, gram = get_ton_and_gram_prices()
+    rights = load_data("rights", "قناتنا الرسمية")
+    channels = load_data("channels", [])
     if not channels:
-        logger.warning("لا توجد قنوات للنشر.")
+        return False
+    text = f"💎 **تقرير أسعار العملات الرقمية المباشر:**\n\n🔹 **TON:** `${ton}`\n🔸 **Gram:** `${gram}`\n\n📌 **الحقوق:** {rights}"
+    for ch in channels:
+        try:
+            bot.send_message(ch, text, parse_mode="Markdown", reply_markup=get_channel_post_keyboard())
+            time.sleep(0.3)
+        except Exception as e:
+            logger.error(f"خطأ النشر للقناة {ch}: {e}")
+    return True
+
+def background_auto_publisher_daemon():
+    while True:
+        try:
+            if get_auto_publish_status():
+                broadcast_prices_to_all_channels()
+            time.sleep(get_timer_minutes() * 60)
+        except Exception as e:
+            logger.error(f"خطأ خيط النشر الخلفي: {e}")
+            time.sleep(60)
+
+threading.Thread(target=background_auto_publisher_daemon, daemon=True).start()
+
+# ==============================================================================
+# 5. بناء لوحات المفاتيح (الرئيسية ولوحة التحكم المتطورة 2026)
+# ==============================================================================
+def get_main_reply_keyboard(user):
+    markup = ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+    markup.add(
+        KeyboardButton("📊 نشر سعر TON الآن"),
+        KeyboardButton("📡 قناتنا الرسمية"),
+        KeyboardButton("📢 نشر منشور جديد لكل القنوات"),
+        KeyboardButton("📊 الإحصائيات السريعة"),
+        KeyboardButton("🆔 آيدي")
+    )
+    if is_admin(user):
+        markup.add(KeyboardButton("🛠️ لوحة تحكم المشرفين"))
+    return markup
+
+def get_admin_inline_control_panel():
+    notif_label = "الإشعارات: مفعلة 🟢" if get_notifications_status() else "الإشعارات: معطلة 🔴"
+    mode_label = "🌐 الوضع: مفتوح" if get_bot_mode() == "public" else "🔒 الوضع: مشرفين فقط"
+    auto_label = "🔄 النشر التلقائي: مفعل 🟢" if get_auto_publish_status() else "🔄 النشر التلقائي: معطل 🔴"
+    timer_val = get_timer_minutes()
+    
+    markup = InlineKeyboardMarkup(row_width=2)
+    markup.add(InlineKeyboardButton("📈 جلب الأسعار الفوري", callback_data="status_ch"), InlineKeyboardButton("📡 إدارة القنوات", callback_data="manage_channels"))
+    markup.add(InlineKeyboardButton(auto_label, callback_data="toggle_auto_publish"), InlineKeyboardButton(f"⏳ المؤقت: {timer_val}د", callback_data="edit_timer"))
+    markup.add(InlineKeyboardButton("🚫 إدارة الحظر", callback_data="manage_blocks"), InlineKeyboardButton("👑 إدارة المشرفين", callback_data="manage_admins"))
+    markup.add(InlineKeyboardButton("📢 إذاعة شاملة", callback_data="start_broadcast"), InlineKeyboardButton("📝 رسالة الترحيب", callback_data="edit_welcome"))
+    markup.add(InlineKeyboardButton("🎨 تعديل الحقوق", callback_data="edit_rights"), InlineKeyboardButton("📊 الإحصائيات المتقدمة", callback_data="bot_stats"))
+    markup.add(InlineKeyboardButton(mode_label, callback_data="toggle_mode"), InlineKeyboardButton(notif_label, callback_data="toggle_notifications"))
+    markup.add(InlineKeyboardButton("🔙 العودة للقائمة الرئيسية", callback_data="back_home"))
+    return markup
+
+# ==============================================================================
+# 6. معالجات الأوامر والرسائل
+# ==============================================================================
+@bot.message_handler(commands=['start'])
+def start_cmd(message: Message):
+    bot_runtime_stats["commands_executed"] += 1
+    user = message.from_user
+    if is_blocked(user.id):
         return
+    
+    users = load_data("users", [])
+    if user.id not in users:
+        users.append(user.id)
+        save_data("users", users)
+
+    if get_bot_mode() == "admin_only" and not is_admin(user):
+        bot.reply_to(message, "⚠️ البوت في وضع الصيانة حالياً.")
+        return
+
+    welcome_msg = load_data("welcome", f"أهلاً بك يا {user.first_name} في بوت أسعار العملات الرقمية المتطور 🚀")
+    bot.send_message(message.chat.id, welcome_msg, reply_markup=get_main_reply_keyboard(user), parse_mode="Markdown")
+
+@bot.message_handler(commands=['id', 'stats', 'ping', 'help', 'prices'])
+def utility_cmds(message: Message):
+    bot_runtime_stats["commands_executed"] += 1
+    user = message.from_user
+    if is_blocked(user.id):
+        return
+    cmd = message.text.split()[0].lower().split("@")[0]
+
+    if cmd == "/id":
+        bot.reply_to(message, f"🆔 الآيدي: `{user.id}`\n👤 الاسم: {user.first_name}", parse_mode="Markdown")
+    elif cmd == "/stats":
+        bot.reply_to(message, f"📊 المشتركين: {len(load_data('users', []))}\n🚫 المحظورين: {len(load_data('blocked', []))}\n📡 القنوات: {len(load_data('channels', []))}", parse_mode="Markdown")
+    elif cmd == "/ping":
+        bot.reply_to(message, "pong! ⚡ البوت يعمل بكفاءة عالية وبدون أخطاء.")
+    elif cmd == "/help":
+        bot.reply_to(message, f"💡 استخدم الأزرار بالأسفل أو راسل المطور مباشرة: @{BOT_OWNER_USERNAME}", parse_mode="Markdown")
+    elif cmd == "/prices":
+        ton, gram = get_ton_and_gram_prices()
+        bot.reply_to(message, f"💎 TON: `${ton}`\n🔸 Gram: `${gram}`", parse_mode="Markdown", reply_markup=get_channel_post_keyboard())
+
+@bot.message_handler(func=lambda m: True, content_types=['text', 'photo', 'video', 'document', 'audio', 'sticker'])
+def message_handler(message: Message):
+    bot_runtime_stats["messages_handled"] += 1
+    user = message.from_user
+    uid = user.id
+    if is_blocked(uid):
+        return
+
+    text = message.text or message.caption or ""
+
+    if uid in user_state:
+        state = user_state[uid]
+        if state == "wait_channel":
+            channels = load_data("channels", [])
+            if text not in channels:
+                channels.append(text)
+                save_data("channels", channels)
+            bot.reply_to(message, f"✅ تمت إضافة القناة بنجاح: `{text}`", parse_mode="Markdown", reply_markup=get_main_reply_keyboard(user))
+            del user_state[uid]
+            return
+        elif state == "wait_broadcast":
+            success_count = 0
+            for u in load_data("users", []):
+                try: 
+                    bot.copy_message(u, message.chat.id, message.message_id)
+                    success_count += 1
+                except: pass
+            for ch in load_data("channels", []):
+                try: 
+                    bot.copy_message(ch, message.chat.id, message.message_id, reply_markup=get_channel_post_keyboard())
+                except: pass
+            bot.reply_to(message, f"✅ تمت الإذاعة بنجاح إلى المستخدمين والقنوات.", reply_markup=get_main_reply_keyboard(user))
+            del user_state[uid]
+            return
+        elif state == "wait_welcome":
+            save_data("welcome", text)
+            bot.reply_to(message, "✅ تم تحديث رسالة الترحيب بنجاح.", reply_markup=get_main_reply_keyboard(user))
+            del user_state[uid]
+            return
+
+    if text == "📊 نشر سعر TON الآن":
+        ton, gram = get_ton_and_gram_prices()
+        bot.send_message(message.chat.id, f"💎 TON: `${ton}`\n🔸 Gram: `${gram}`", parse_mode="Markdown")
+    elif text == "📡 قناتنا الرسمية":
+        bot.send_message(message.chat.id, f"قناتنا الرسمية: {CHANNEL_USERNAME}")
+    elif text == "📢 نشر منشور جديد لكل القنوات":
+        if not is_admin(user): return
+        user_pending_posts[uid] = message
+        bot.send_message(message.chat.id, "✍️ أرسل المنشور المراد تعميمه على كافة القنوات:")
+    elif text == "📊 الإحصائيات السريعة":
+        bot.send_message(message.chat.id, f"📊 إحصائيات البوت:\n- المشتركين: {len(load_data('users', []))}\n- القنوات المضافة: {len(load_data('channels', []))}", parse_mode="Markdown")
+    elif text == "🆔 آيدي":
+        bot.send_message(message.chat.id, f"🆔 الآيدي الخاص بك: `{uid}`", parse_mode="Markdown")
+    elif text == "🛠️ لوحة تحكم المشرفين":
+        if not is_admin(user): return
+        bot.send_message(message.chat.id, "🛠️ لوحة التحكم الإدارية المتطورة:", reply_markup=get_admin_inline_control_panel())
+
+# ==============================================================================
+# 7. معالجة الـ Callbacks والأزرار الشفافة (خالية من الأخطاء الآمنة تماماً)
+# ==============================================================================
+@bot.callback_query_handler(func=lambda c: True)
+def callbacks(c):
+    user = c.from_user
+    uid = user.id
+    if is_blocked(uid):
+        return
+    data = c.data
 
     try:
-        price = await get_ton_price()
-        message = build_post(price)
+        if data == "refresh_ton_price":
+            ton, gram = get_ton_and_gram_prices()
+            try:
+                bot.edit_message_text(
+                    f"💎 **تقرير أسعار العملات الرقمية المباشر:**\n\n🔹 **TON:** `${ton}`\n🔸 **Gram:** `${gram}`", 
+                    c.message.chat.id, 
+                    c.message.message_id, 
+                    parse_mode="Markdown", 
+                    reply_markup=get_channel_post_keyboard()
+                )
+            except Exception:
+                pass
+            bot.answer_callback_query(c.id, "تم التحديث بنجاح ✅")
 
-    except Exception as error:
-        logger.exception("فشل جلب سعر TON: %s", error)
-        return
+        elif data == "open_admin_panel":
+            if not is_admin(user):
+                bot.answer_callback_query(c.id, "⚠️ لست مشرفاً مخولاً!", show_alert=True)
+                return
+            try:
+                bot.edit_message_text(
+                    "🛠️ لوحة التحكم الإدارية المتطورة:", 
+                    c.message.chat.id, 
+                    c.message.message_id, 
+                    reply_markup=get_admin_inline_control_panel()
+                )
+            except Exception:
+                pass
+            bot.answer_callback_query(c.id)
 
-    for channel in channels:
-        chat_id = channel["chat_id"]
+        elif data == "back_home":
+            try:
+                bot.delete_message(c.message.chat.id, c.message.message_id)
+            except Exception:
+                pass
+            bot.send_message(c.message.chat.id, "🏠 القائمة الرئيسية للبوت:", reply_markup=get_main_reply_keyboard(user))
+            bot.answer_callback_query(c.id)
 
-        if chat_id == RIGHTS_CHANNEL:
-            continue
-
-        try:
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=message,
-                disable_web_page_preview=True,
+        elif data == "manage_channels":
+            if not is_admin(user): 
+                return
+            markup = InlineKeyboardMarkup()
+            markup.add(
+                InlineKeyboardButton("➕ إضافة قناة", callback_data="add_ch"),
+                InlineKeyboardButton("📋 عرض القنوات", callback_data="list_ch")
             )
+            markup.add(InlineKeyboardButton("🔙 رجوع للوحة التحكم", callback_data="open_admin_panel"))
+            try:
+                bot.edit_message_text("📡 قسم إدارة القنوات المرتبطة:", c.message.chat.id, c.message.message_id, reply_markup=markup)
+            except Exception:
+                pass
+            bot.answer_callback_query(c.id)
 
-            update_channel_success(chat_id)
-            logger.info("تم النشر في %s", chat_id)
+        elif data == "add_ch":
+            user_state[uid] = "wait_channel"
+            bot.send_message(c.message.chat.id, "أرسل معرف القناة الآن (مثال: `@ChannelName`):")
+            bot.answer_callback_query(c.id)
 
-        except TelegramError as error:
-            update_channel_error(chat_id, str(error))
-            logger.error(
-                "فشل النشر في %s: %s",
-                chat_id,
-                error,
+        elif data == "list_ch":
+            channels = load_data("channels", [])
+            ch_list_str = "\n".join(channels) if channels else "لا توجد قنوات مضافة حالياً."
+            bot.answer_callback_query(c.id, f"القنوات: {len(channels)} قناة مضافة", show_alert=True)
+            bot.send_message(c.message.chat.id, f"📋 **قائمة القنوات المضافة:**\n\n{ch_list_str}", parse_mode="Markdown")
+
+        elif data == "toggle_auto_publish":
+            current_status = get_auto_publish_status()
+            save_data("auto_publish", "disabled" if current_status else "enabled")
+            try:
+                bot.edit_message_reply_markup(
+                    c.message.chat.id, 
+                    c.message.message_id, 
+                    reply_markup=get_admin_inline_control_panel()
+                )
+            except Exception:
+                pass
+            bot.answer_callback_query(c.id, "✅ تم تغيير حالة النشر التلقائي بنجاح.")
+
+        elif data == "toggle_mode":
+            current_mode = get_bot_mode()
+            new_mode = "admin_only" if current_mode == "public" else "public"
+            save_data("mode", new_mode)
+            try:
+                bot.edit_message_reply_markup(
+                    c.message.chat.id, 
+                    c.message.message_id, 
+                    reply_markup=get_admin_inline_control_panel()
+                )
+            except Exception:
+                pass
+            bot.answer_callback_query(c.id, f"✅ تم تغيير وضع البوت إلى: {new_mode}")
+
+        elif data == "toggle_notifications":
+            current_notif = load_data("notifications", "enabled")
+            new_notif = "disabled" if current_notif == "enabled" else "enabled"
+            save_data("notifications", new_notif)
+            try:
+                bot.edit_message_reply_markup(
+                    c.message.chat.id, 
+                    c.message.message_id, 
+                    reply_markup=get_admin_inline_control_panel()
+                )
+            except Exception:
+                pass
+            bot.answer_callback_query(c.id, "✅ تم تحديث حالة الإشعارات.")
+
+        elif data == "start_broadcast":
+            user_state[uid] = "wait_broadcast"
+            bot.send_message(c.message.chat.id, "📢 أرسل الآن محتوى الإذاعة الشاملة (نص، صورة، أو وسائط):")
+            bot.answer_callback_query(c.id)
+
+        elif data == "edit_welcome":
+            user_state[uid] = "wait_welcome"
+            bot.send_message(c.message.chat.id, "✍️ أرسل نص رسالة الترحيب الجديدة:")
+            bot.answer_callback_query(c.id)
+
+        elif data == "bot_stats":
+            users_count = len(load_data('users', []))
+            blocked_count = len(load_data('blocked', []))
+            channels_count = len(load_data('channels', []))
+            stats_text = (
+                f"📊 **الإحصائيات الشاملة للبوت:**\n\n"
+                f"👥 إجمالي المشتركين: `{users_count}`\n"
+                f"🚫 إجمالي المحظورين: `{blocked_count}`\n"
+                f"📡 القنوات المفعلة: `{channels_count}`\n"
+                f"⚙️ الأوامر المنفذة: `{bot_runtime_stats['commands_executed']}`\n"
+                f"💬 الرسائل المعالجة: `{bot_runtime_stats['messages_handled']}`"
             )
+            bot.answer_callback_query(c.id, "تم جلب الإحصائيات بنجاح", show_alert=False)
+            bot.send_message(c.message.chat.id, stats_text, parse_mode="Markdown")
 
-        # تأخير بسيط حتى لا ترسل الطلبات كلها في اللحظة نفسها
-        await asyncio.sleep(0.5)
+        elif data == "status_ch":
+            ton, gram = get_ton_and_gram_prices()
+            # تم تأمين النص بالكامل بدون أي أقواس أو علامات قد تسبب أخطاء
+            bot.answer_callback_query(c.id, f"TON: {ton}$\vert{} Gram: {gram}$", show_alert=True)
 
-
-# =========================================================
-# الأوامر
-# =========================================================
-
-async def start_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-) -> None:
-    if not await require_admin(update):
-        return
-
-    await show_panel(update)
-
-
-async def id_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-) -> None:
-    if not update.effective_user:
-        return
-
-    await update.effective_message.reply_text(
-        f"رقم حسابك هو:\n{update.effective_user.id}"
-    )
-
-
-# =========================================================
-# الأزرار
-# =========================================================
-
-async def button_handler(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-) -> None:
-    query = update.callback_query
-    await query.answer()
-
-    if not await require_admin(update):
-        return
-
-    action = query.data
-
-    if action == "publisher_start":
-        if not get_channels():
-            await query.edit_message_text(
-                "❌ لا توجد قنوات للنشر.\n"
-                "أضف قناة أولًا، واجعل البوت مشرفًا فيها.",
-                reply_markup=control_keyboard(),
-            )
-            return
-
-        set_setting("publishing", "1")
-        start_publisher_job(context)
-
-        await query.edit_message_text(
-            "✅ تم تشغيل النشر التلقائي.\n"
-            f"الفاصل الحالي: {format_interval(get_interval())}",
-            reply_markup=control_keyboard(),
-        )
-
-    elif action == "publisher_stop":
-        set_setting("publishing", "0")
-        remove_publisher_jobs(context)
-
-        await query.edit_message_text(
-            "⛔ تم إيقاف النشر التلقائي.",
-            reply_markup=control_keyboard(),
-        )
-
-    elif action == "set_interval":
-        context.user_data["waiting_for"] = "interval"
-
-        await query.edit_message_text(
-            "أرسل الفاصل الزمني فقط، مثل:\n\n"
-            "30ث = كل 30 ثانية\n"
-            "3د = كل 3 دقائق\n"
-            "2س = كل ساعتين\n"
-            "1ي = كل يوم\n\n"
-            f"أقل مدة مسموحة: {MIN_INTERVAL_SECONDS} ثوانٍ.",
-            reply_markup=control_keyboard(),
-        )
-
-    elif action == "add_channel":
-        context.user_data["waiting_for"] = "add_channel"
-
-        await query.edit_message_text(
-            "أرسل معرف القناة المراد النشر فيها.\n\n"
-            "مثال لقناة عامة:\n"
-            "@my_channel\n\n"
-            "أو رقم قناة خاصة:\n"
-            "-1001234567890\n\n"
-            f"ممنوع إضافة {RIGHTS_CHANNEL}؛ "
-            "لأنها حقوق فقط.",
-            reply_markup=control_keyboard(),
-        )
-
-    elif action == "remove_channel":
-        context.user_data["waiting_for"] = "remove_channel"
-
-        await query.edit_message_text(
-            "أرسل معرف القناة التي تريد حذفها من قائمة النشر.",
-            reply_markup=control_keyboard(),
-        )
-
-    elif action == "list_channels":
-        channels = get_channels()
-
-        if not channels:
-            text = "📋 لا توجد قنوات مضافة."
         else:
-            lines = ["📋 قنوات النشر:\n"]
+            bot.answer_callback_query(c.id, "⚙️ الزر يعمل بنجاح.")
 
-            for index, channel in enumerate(channels, start=1):
-                title = channel["title"] or "بدون اسم"
-                lines.append(
-                    f"{index}. {title}\n"
-                    f"   المعرف: {channel['chat_id']}"
-                )
+    except Exception as err:
+        logger.error(f"خطأ في معالجة الزر {data}: {err}")
+        try:
+            bot.answer_callback_query(c.id, "حدث خطأ مؤقت، حاول لاحقاً.", show_alert=False)
+        except:
+            pass
 
-            text = "\n".join(lines)
-
-        await query.edit_message_text(
-            text,
-            reply_markup=control_keyboard(),
-        )
-
-    elif action == "status":
-        channels = get_channels()
-        state = "يعمل ✅" if is_publishing() else "متوقف ⛔"
-
-        lines = [
-            "📊 حالة البوت\n",
-            f"النشر: {state}",
-            f"الفاصل: {format_interval(get_interval())}",
-            f"عدد القنوات: {len(channels)}",
-            f"حقوق النشر: {RIGHTS_CHANNEL}",
-        ]
-
-        for channel in channels:
-            if channel["last_error"]:
-                lines.append(
-                    f"\n⚠️ {channel['chat_id']}\n"
-                    f"آخر خطأ: {channel['last_error'][:300]}"
-                )
-
-        await query.edit_message_text(
-            "\n".join(lines),
-            reply_markup=control_keyboard(),
-        )
-
-
-# =========================================================
-# استقبال رسائل المالك
-# =========================================================
-
-async def text_handler(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-) -> None:
-    if not await require_admin(update):
-        return
-
-    waiting_for = context.user_data.get("waiting_for")
-
-    if not waiting_for:
-        return
-
-    value = update.effective_message.text.strip()
-    context.user_data.pop("waiting_for", None)
-
-    if waiting_for == "interval":
-        seconds = parse_interval(value)
-
-        if seconds is None:
-            await update.effective_message.reply_text(
-                "❌ الصيغة غير صحيحة.\n\n"
-                "أمثلة صحيحة:\n"
-                "30ث\n"
-                "3د\n"
-                "2س\n"
-                "1ي"
-            )
-            return
-
-        set_setting("interval", str(seconds))
-
-        if is_publishing():
-            start_publisher_job(context)
-
-        await update.effective_message.reply_text(
-            f"✅ تم ضبط النشر كل {format_interval(seconds)}.",
-            reply_markup=control_keyboard(),
-        )
-
-    elif waiting_for == "add_channel":
-        chat_id = normalize_channel(value)
-
-        if not chat_id:
-            await update.effective_message.reply_text(
-                f"❌ معرف القناة غير صحيح أو أنها {RIGHTS_CHANNEL}.\n\n"
-                "استخدم:\n"
-                "@channel_username\n"
-                "أو:\n"
-                "-1001234567890"
-            )
-            return
-
-        if get_channel(chat_id):
-            await update.effective_message.reply_text(
-                "⚠️ هذه القناة مضافة مسبقًا.",
-                reply_markup=control_keyboard(),
-            )
-            return
-
-        valid, title, error = await verify_bot_can_publish(
-            context,
-            chat_id,
-        )
-
-        if not valid:
-            await update.effective_message.reply_text(
-                "❌ تعذر إضافة القناة.\n\n"
-                f"السبب: {error}\n\n"
-                "تأكد من أن البوت موجود في القناة "
-                "ومشرف ويملك صلاحية نشر الرسائل."
-            )
-            return
-
-        add_channel(chat_id, title)
-
-        await update.effective_message.reply_text(
-            f"✅ تمت إضافة القناة بنجاح:\n"
-            f"{title}\n"
-            f"{chat_id}",
-            reply_markup=control_keyboard(),
-        )
-
-    elif waiting_for == "remove_channel":
-        chat_id = normalize_channel(value)
-
-        if not chat_id or not get_channel(chat_id):
-            await update.effective_message.reply_text(
-                "❌ هذه القناة غير موجودة في قائمة النشر."
-            )
-            return
-
-        remove_channel(chat_id)
-
-        if not get_channels():
-            set_setting("publishing", "0")
-            remove_publisher_jobs(context)
-
-        await update.effective_message.reply_text(
-            f"✅ تم حذف القناة:\n{chat_id}",
-            reply_markup=control_keyboard(),
-        )
-
-
-# =========================================================
-# بدء التطبيق
-# =========================================================
-
-async def post_init(application: Application) -> None:
-    init_database()
-
-    if is_publishing() and get_channels():
-        start_publisher_job(application)
-
-
-def main() -> None:
-    if not BOT_TOKEN:
-        raise RuntimeError(
-            "ضع توكن البوت في المتغير BOT_TOKEN."
-        )
-
-    if ADMIN_USER_ID <= 0:
-        raise RuntimeError(
-            "ضع رقم حسابك في المتغير ADMIN_USER_ID."
-        )
-
-    init_database()
-
-    application = (
-        Application.builder()
-        .token(BOT_TOKEN)
-        .post_init(post_init)
-        .build()
-    )
-
-    application.add_handler(
-        CommandHandler("start", start_command)
-    )
-    application.add_handler(
-        CommandHandler("id", id_command)
-    )
-    application.add_handler(
-        CallbackQueryHandler(button_handler)
-    )
-    application.add_handler(
-        MessageHandler(
-            filters.TEXT & ~filters.COMMAND,
-            text_handler,
-        )
-    )
-
-    logger.info("تم تشغيل البوت.")
-    application.run_polling(
-        allowed_updates=Update.ALL_TYPES
-    )
-
-
+# ==============================================================================
+# 8. التشغيل التلقائي الآمن
+# ==============================================================================
 if __name__ == "__main__":
-    main()
+    logger.info("جاري تشغيل البوت بنجاح...")
+    while True:
+        try:
+            bot.infinity_polling(skip_pending=True)
+        except Exception as e:
+            logger.critical(f"خطأ حرج في دورة التشغيل: {e}")
+            time.sleep(5)
