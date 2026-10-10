@@ -60,7 +60,7 @@ def access_markup():
 
 
 def deny(chat_id):
-    bot.send_message(chat_id, "⛔ البوت مخصص للمشرفين فقط.\n\nتوجه إلى المطور حتى يفعّل لك البوت:\n@J_6_K", reply_markup=access_markup())
+    bot.send_message(chat_id, "⛔ البوت مخصص للمشرفين فقط.\n\nتوجه إلى المطور حتى يفعّل لك البوت:\n@eceoc", reply_markup=access_markup())
 
 
 def minutes():
