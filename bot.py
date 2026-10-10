@@ -10,7 +10,7 @@ from telebot.types import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup
 
 TOKEN = os.getenv("BOT_TOKEN", "")
 OWNER_ID = int(os.getenv("ADMIN_USER_ID", "105405258"))
-OWNER_USERNAME = "J_6_K"
+OWNER_USERNAME = "@eceoc"
 DEFAULT_BUTTON = {"text": "👤 المطور", "url": f"https://t.me/{OWNER_USERNAME}"}
 FILES = {"channels": "database_channels_store.json", "admins": "database_admins_store.json", "users": "database_users_store.json", "blocked": "database_blocked_store.json", "timer": "config_timer_interval.txt", "auto": "config_auto_publish_state.txt", "developer": "config_developer.txt", "welcome": "config_welcome_message.txt", "mode": "config_operational_mode.txt", "notifications": "config_notifications_state.txt", "button": "config_custom_button.json"}
 if not TOKEN: raise RuntimeError("BOT_TOKEN غير موجود")
